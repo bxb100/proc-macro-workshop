@@ -1,14 +1,65 @@
+use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
-use syn::{parse_macro_input, Data, DeriveInput};
+use syn::{parse_macro_input, Data, DeriveInput, Expr, Field, Type};
 
-#[proc_macro_derive(Builder)]
+fn get_field_type_argument<'k>(ident: &str, field: &'k Field) -> Option<&'k Type> {
+    // Option<String>
+    if let Type::Path(syn::TypePath { ref path, .. }) = field.ty {
+        if path.segments.len() == 1 && path.segments[0].ident == ident {
+            if let syn::PathArguments::AngleBracketed(ref inner_type) = path.segments[0].arguments {
+                if inner_type.args.len() != 1 {
+                    return None;
+                }
+                if let syn::GenericArgument::Type(ref ty) = inner_type.args[0] {
+                    return Some(ty);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn get_attr_name(field: &Field) -> Result<Option<syn::Ident>, TokenStream> {
+    // #[builder(each = "env")]
+    for attr in &field.attrs {
+        if attr.path().is_ident("builder") {
+            if let Ok(Expr::Assign(syn::ExprAssign {
+                left,
+                right,
+                ..
+            })) = attr.parse_args::<Expr>()
+            {
+                if let Expr::Path(p) = *left {
+                    if !p.path.is_ident("each") {
+                        return Err(syn::Error::new_spanned(
+                            // FIXME: using other parse way
+                            attr.meta.clone(),
+                            "expected `builder(each = \"...\")`",
+                        )
+                        .into_compile_error());
+                    }
+                }
+
+                if let Expr::Lit(syn::ExprLit {
+                    lit: syn::Lit::Str(lit),
+                    ..
+                }) = *right
+                {
+                    return Ok(Some(format_ident!("{}", lit.value())));
+                }
+            }
+        }
+    }
+
+    // Err(syn::Error::new(field.span(), "cs"))
+    Ok(None)
+}
+
+#[proc_macro_derive(Builder, attributes(builder))]
 pub fn derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
-    println!("{:#?}", input);
 
     let DeriveInput { ident, data, .. } = input;
-
-    let builder_name = format_ident!("{}Builder", ident);
 
     let fields = if let Data::Struct(syn::DataStruct {
         fields: syn::Fields::Named(syn::FieldsNamed { ref named, .. }),
@@ -19,75 +70,119 @@ pub fn derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     } else {
         unimplemented!()
     };
-    
-    // build a `Indent + Builder` struct
-    let builder_struct = {
-        let fields = fields.iter().map(|field| {
-            let ident = &field.ident;
-            let ty = &field.ty;
+
+    // pass 08
+    for f in fields {
+        if let Err(e) = get_attr_name(f) {
+            return e.into();
+        }
+    }
+
+    let builder_struct_fields = fields.iter().map(|field| {
+        let ident = &field.ident;
+        let ty = &field.ty;
+        if get_field_type_argument("Option", field).is_some()
+            || get_attr_name(field).unwrap().is_some()
+        {
             quote! {
-                #ident: Option<#ty>,
+                #ident: #ty
             }
-        });
-        quote! {
-            pub struct #builder_name {
-                #(#fields)*
+        } else {
+            quote! {
+                #ident: ::std::option::Option<#ty>
             }
         }
-    };
-    let builder_struct_impl = {
-        let functions = fields.iter().map(|field| {
-            let ident = &field.ident;
-            let ty = &field.ty;
+    });
+    let builder_new_fields = fields.iter().map(|field| {
+        let ident = &field.ident;
+        if get_attr_name(field).unwrap().is_some() {
+            quote! {
+                #ident: ::std::vec![]
+            }
+        } else {
+            quote! {
+                #ident: ::std::option::Option::None
+            }
+        }
+    });
+    let builder_methods = fields.iter().map(|field| {
+        let ident = &field.ident;
+        let ty = &field.ty;
+        if let Some(each) = get_attr_name(field).unwrap() {
+            if let Some(inner_type) = get_field_type_argument("Vec", field) {
+                return quote! {
+                    pub fn #each(&mut self, #each: #inner_type) -> &mut Self {
+                        self.#ident.push(#each);
+                        self
+                    }
+                };
+            }
+        }
+
+        if let Some(inner_type) = get_field_type_argument("Option", field) {
+            quote! {
+                pub fn #ident(&mut self, #ident: #inner_type) -> &mut Self {
+                    self.#ident = Some(#ident);
+                    self
+                }
+            }
+        } else {
             quote! {
               pub fn #ident(&mut self, #ident: #ty) -> &mut Self {
                 self.#ident = Some(#ident);
                 self
               }
             }
-        });
-
-        let builder_fields = fields.iter().map(|field| {
-            let ident = &field.ident;
+        }
+    });
+    let build_fields = fields.iter().map(|field| {
+        let ident = &field.ident;
+        if get_field_type_argument("Option", field).is_some()
+            || get_attr_name(field).unwrap().is_some()
+        {
             quote! {
-                #ident: self.#ident.clone().ok_or("filed was not set")?,
+                #ident: self.#ident.clone()
             }
-        });
-        quote! {
-            impl #builder_name {
-                #(#functions)*
-                
-                fn build(&mut self) -> Result<#ident, Box<dyn std::error::Error>> {
-                    Ok(#ident {
-                        #(#builder_fields)*
-                    })
-                }
+        } else {
+            quote! {
+                #ident: self.#ident.clone().ok_or("filed was not set")?
             }
         }
-    };
-    // build a impl with function `builder` that returns a `Indent + Builder` struct
-    let builder = {
-        let fields = fields.iter().map(|field| {
-            let ident = &field.ident;
-            quote! {
-                #ident: None,
-            }
-        });
-        quote! {
-            impl #ident {
-                pub fn builder() -> #builder_name {
-                    #builder_name {
-                        #(#fields)*
+    });
+
+    let builder_name = format_ident!("{}Builder", ident);
+
+    
+    let builder = quote! {
+
+        pub struct #builder_name {
+            #( #builder_struct_fields ),*
+        }
+
+        impl #builder_name {
+            #( #builder_methods )*
+
+            fn build(self: &mut Self) -> ::std::result::Result<#ident, ::std::boxed::Box<dyn std::error::Error>> {
+                ::std::result::Result::Ok(
+                    #ident {
+                        #( #build_fields ),*
                     }
+                )
+            }
+        }
+    };
+    let ident_impl = quote! {
+      impl #ident {
+            fn builder() -> #builder_name {
+                #builder_name {
+                    #( #builder_new_fields ),*
                 }
             }
         }
     };
-    let expand = quote! {
-        #builder_struct
-        #builder_struct_impl
-        #builder
-    };
 
-    proc_macro::TokenStream::from(expand)
+    proc_macro::TokenStream::from(quote! {
+        #builder
+        #ident_impl
+    })
 }

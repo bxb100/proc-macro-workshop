@@ -1,6 +1,6 @@
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
-use syn::{parse_macro_input, Data, DeriveInput, Expr, Field, Type};
+use syn::{parse_macro_input, Data, DeriveInput, Expr, Field, Meta, Type};
 
 fn get_field_type_argument<'k>(ident: &str, field: &'k Field) -> Option<&'k Type> {
     // Option<String>
@@ -23,35 +23,28 @@ fn get_attr_name(field: &Field) -> Result<Option<syn::Ident>, TokenStream> {
     // #[builder(each = "env")]
     for attr in &field.attrs {
         if attr.path().is_ident("builder") {
-            if let Ok(Expr::Assign(syn::ExprAssign {
-                left,
-                right,
-                ..
-            })) = attr.parse_args::<Expr>()
-            {
-                if let Expr::Path(p) = *left {
-                    if !p.path.is_ident("each") {
-                        return Err(syn::Error::new_spanned(
-                            // FIXME: using other parse way
-                            attr.meta.clone(),
-                            "expected `builder(each = \"...\")`",
-                        )
-                        .into_compile_error());
-                    }
+            if let Ok(meta) = attr.parse_args::<Meta>() {
+                if !meta.path().is_ident("each") {
+                    return Err(syn::Error::new_spanned(
+                        attr.meta.clone(),
+                        "expected `builder(each = \"...\")`",
+                    )
+                    .into_compile_error());
                 }
-
-                if let Expr::Lit(syn::ExprLit {
-                    lit: syn::Lit::Str(lit),
+                if let Meta::NameValue(syn::MetaNameValue {
+                    value:
+                        Expr::Lit(syn::ExprLit {
+                            lit: syn::Lit::Str(lit_str),
+                            ..
+                        }),
                     ..
-                }) = *right
+                }) = meta
                 {
-                    return Ok(Some(format_ident!("{}", lit.value())));
+                    return Ok(Some(format_ident!("{}", lit_str.value())));
                 }
             }
         }
     }
-
-    // Err(syn::Error::new(field.span(), "cs"))
     Ok(None)
 }
 
@@ -71,7 +64,7 @@ pub fn derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
         unimplemented!()
     };
 
-    // pass 08
+    // TODO: pass 08, does there have a better solution?
     for f in fields {
         if let Err(e) = get_attr_name(f) {
             return e.into();
@@ -108,6 +101,7 @@ pub fn derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let builder_methods = fields.iter().map(|field| {
         let ident = &field.ident;
         let ty = &field.ty;
+        // TIPS: No need check error here, because we put in the first, don't meddle this generation
         if let Some(each) = get_attr_name(field).unwrap() {
             if let Some(inner_type) = get_field_type_argument("Vec", field) {
                 return quote! {
@@ -152,7 +146,6 @@ pub fn derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
 
     let builder_name = format_ident!("{}Builder", ident);
 
-    
     let builder = quote! {
 
         pub struct #builder_name {

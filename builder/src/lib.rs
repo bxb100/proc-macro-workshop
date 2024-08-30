@@ -163,9 +163,8 @@ pub fn derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
                 )
             }
         }
-    };
-    let ident_impl = quote! {
-      impl #ident {
+
+        impl #ident {
             fn builder() -> #builder_name {
                 #builder_name {
                     #( #builder_new_fields ),*
@@ -174,8 +173,5 @@ pub fn derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
         }
     };
 
-    proc_macro::TokenStream::from(quote! {
-        #builder
-        #ident_impl
-    })
+    builder.into()
 }
